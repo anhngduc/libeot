@@ -292,22 +292,43 @@ enum StreamResult streamCopy(struct Stream *sIn, struct Stream *sOut,
 /* FIXME: This could be made A LOT faster. I am too lazy to figure out how. */
 enum StreamResult readNBits(struct Stream *s, uint32_t *out, unsigned n)
 {
-  const uint8_t masks[] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
   if (n > 32) {
     return EOT_VALUE_OUT_OF_BOUNDS;
   }
   *out = 0;
-  for (unsigned i = 0; i < n; ++i) {
-    if (s->pos >= s->size) {
-      return EOT_NOT_ENOUGH_DATA;
-    }
-    bool bitSet = (s->buf[s->pos] & masks[s->bitPos]) > 0;
-    *out |= (bitSet ? 1 : 0) << (n - i - 1);
-    ++s->bitPos;
-    if (s->bitPos == 8) {
-      s->bitPos = 0;
-      ++s->pos;
-    }
+  unsigned drop = 0;
+  uint32_t mask = 0xFFFFFFFF;
+
+  unsigned total = s->bitPos + n;
+  if (total > 0 && total <= 8) {
+    // byte 0 only
+    drop = 8 - s->bitPos - n;
+    mask = 0xFFFFFFFF >> (24 + drop + s->bitPos);
+    *out = (uint32_t)(s->buf[s->pos] >> drop) & mask;
+    s->bitPos = total % 8;
+    if (s->bitPos == 0) s->pos++;
+    // s->pos;
+  } else if (total >  8 && total <= 16){
+    // byte 0, 1
+    drop = 16 - s->bitPos - n;
+    mask = 0xFFFFFFFF >> (16 + drop + s->bitPos);
+    *out = (uint32_t)((s->buf[s->pos] << 8 | s->buf[s->pos+1]) >> drop) & mask;
+    s->bitPos = total % 8;
+    if (s->bitPos == 0) s->pos+=2; else s->pos++;    
+  } else if (total >  16 && total <= 24){
+    // byte 0, 1, 2
+    drop = 24 - s->bitPos - n;
+    mask = 0xFFFFFFFF >> (8 + drop + s->bitPos);
+    *out = (uint32_t)((s->buf[s->pos] << 16 | s->buf[s->pos+1] << 8 | s->buf[s->pos+2]) >> drop) & mask;
+    s->bitPos = total % 8;
+    if (s->bitPos == 0) s->pos+=3; else  s->pos += 2;
+  } else if (total >  24 && total <= 32){
+    // byte 0, 1, 2, 3
+    drop = 32 - s->bitPos - n;
+    mask = 0xFFFFFFFF >> (drop + s->bitPos);
+    *out = (uint32_t)((s->buf[s->pos] << 24 | s->buf[s->pos+1] << 16 | s->buf[s->pos+2] << 8 | s->buf[s->pos+3]) >> drop) & mask;
+    s->bitPos = total % 8;
+    if (s->bitPos == 0) s->pos+=4; else s->pos += 3;
   }
   return EOT_STREAM_OK;
 }
