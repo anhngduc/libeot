@@ -1,7 +1,4 @@
-<a href="https://scan.coverity.com/projects/anhngduc-libeot">
-  <img alt="Coverity Scan Build Status"
-       src="https://scan.coverity.com/projects/anhngduc-libeot/badge.svg/>
-</a>
+[![Coverity Scan](https://scan.coverity.com/projects/30610/badge.svg)](https://scan.coverity.com/projects/anhngduc-libeot)
 
 # How to build
 
