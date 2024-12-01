@@ -71,6 +71,15 @@ set_target_properties(libeot PROPERTIES PUBLIC_HEADER "${LIBEOT_HEADERS}")
 add_executable(eot2ttf src/eot2ttf.c)
 target_link_libraries(eot2ttf libeot)
 
+
+add_executable(teststream src/tests/test-stream.c src/util/stream.h src/util/stream.c)
+
+enable_testing()
+add_test(
+    NAME stream-test
+    COMMAND $<TARGET_FILE:teststream>
+)
+
 # Install targets
 install(TARGETS libeot
     LIBRARY DESTINATION lib
