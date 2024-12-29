@@ -11,7 +11,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
  
 # Common flags
-set(COMMON_FLAGS "-std=c99 -DDECOMPRESS_ON")
+set(COMMON_FLAGS "-std=c99 -DDECOMPRESS_ON -DCOMPRESS_ON -DLZCOMP_MAIN")
  
 # Debug and Release flags
 set(DEBUG_FLAGS "-Werror -Wall -g -O0 ${COMMON_FLAGS}")
@@ -71,6 +71,8 @@ set_target_properties(libeot PROPERTIES PUBLIC_HEADER "${LIBEOT_HEADERS}")
 add_executable(eot2ttf src/eot2ttf.c)
 target_link_libraries(eot2ttf libeot)
 
+add_executable(lzcomp src/lzcomp/liblzcomp.c)
+target_link_libraries(lzcomp libeot)
 
 add_executable(teststream src/tests/test-stream.c src/util/stream.h src/util/stream.c)
 

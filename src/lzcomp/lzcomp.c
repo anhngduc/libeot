@@ -59,7 +59,7 @@ static void SetDistRange(LZCOMP *t, long length)
 /* Returns the number of distance ranges necessary to encode the <distance> */
 #ifndef SLOWER
 #define GetNumberofDistRanges(distance)                                        \
-  ((MTX_AHUFF_BitsUsed((distance)-dist_min) + dist_width - 1) / dist_width)
+  ((MTX_AHUFF_BitsUsed((distance) - dist_min) + dist_width - 1) / dist_width)
 #else
 static long GetNumberofDistRanges(register long distance)
 {
@@ -813,9 +813,9 @@ static unsigned char *Decode(register LZCOMP *t, long *size)
           length++;
         start = pos - distance - length + 1;
         // out-of-bound
-        if (start < (-1)*preLoadSize || start + length >= t->out_len) {
-            MTX_mem_free( t->mem, dataOut);
-            return NULL;
+        if (start < (-1) * preLoadSize || start + length >= t->out_len) {
+          MTX_mem_free(t->mem, dataOut);
+          return NULL;
         }
         for (j = 0; j < length; j++) {
           value = ptr1[start + j];
@@ -953,8 +953,12 @@ void *memcpyHuge(void *object2, void *object1, unsigned long size)
   unsigned long i;
   void *object2Ptr;
   object2Ptr = object2;
-  for (i = 0; i < size; i++)
-    *(((char __huge *)object2)++) = *(((char __huge *)object1)++);
+  for (i = 0; i < size; i++) {
+    *((char *)object2) = *((char *)object1);
+    object1 = (char *)object1 + 1;
+    object2 = (char *)object2 + 1;
+  }
+  //*(((char *)object2)++) = *(((char *)object1)++);
   return object2Ptr;
 }
 
@@ -987,7 +991,7 @@ unsigned char *MTX_LZCOMP_PackMemory(register LZCOMP *t, void *dataIn,
   t->ptr1 = (unsigned char *)MTX_mem_malloc(
       t->mem, sizeof(unsigned char) * (t->length1 + preLoadSize));
 
-  memcpyHuge((unsigned char __huge *)t->ptr1 + preLoadSize, dataIn, t->length1);
+  memcpyHuge((unsigned char *)t->ptr1 + preLoadSize, dataIn, t->length1);
 
   t->usingRunLength = false;
   {
@@ -995,9 +999,9 @@ unsigned char *MTX_LZCOMP_PackMemory(register LZCOMP *t, void *dataIn,
     unsigned char *out, *d;
     t->rlComp = MTX_RUNLENGTHCOMP_Create(t->mem);
 
-    out = MTX_RUNLENGTHCOMP_PackData(
-        t->rlComp, (unsigned char __huge *)t->ptr1 + preLoadSize, t->length1,
-        &packedLength);
+    out = MTX_RUNLENGTHCOMP_PackData(t->rlComp,
+                                     (unsigned char *)t->ptr1 + preLoadSize,
+                                     t->length1, &packedLength);
     /* Only use run-length encoding if there is a clear benefit */
     if (packedLength < t->length1 * 3 / 4) {
       t->usingRunLength = true;
@@ -1005,7 +1009,7 @@ unsigned char *MTX_LZCOMP_PackMemory(register LZCOMP *t, void *dataIn,
       MTX_mem_free(t->mem, t->ptr1);
       t->ptr1 = (unsigned char *)MTX_mem_malloc(
           t->mem, sizeof(unsigned char) * (t->length1 + preLoadSize));
-      d = (unsigned char __huge *)t->ptr1 + preLoadSize;
+      d = (unsigned char *)t->ptr1 + preLoadSize;
       for (i = 0; i < t->length1; i++) {
         *d++ = out[i];
       }
@@ -1114,7 +1118,8 @@ unsigned char *MTX_LZCOMP_UnPackMemory(register LZCOMP *t, void *dataIn,
   MTX_RUNLENGTHCOMP_Destroy(t->rlComp);
   t->rlComp = NULL;
 
-  if (dataOut) assert(t->usingRunLength || *sizeOut < maxOutSize);
+  if (dataOut)
+    assert(t->usingRunLength || *sizeOut < maxOutSize);
 
 #ifdef VERBOSE
   /*cout << "Wrote " << *sizeOut << " Bytes to file <" << outName << ">" <<
