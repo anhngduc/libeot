@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
+set(CMAKE_C_COMPILER clang)
+set(CMAKE_CXX_COMPILER clang)
 project(libeot VERSION 0.01)
 
 
@@ -14,7 +16,7 @@ endif()
 set(COMMON_FLAGS "-std=c99 -DDECOMPRESS_ON -DCOMPRESS_ON -DLZCOMP_MAIN")
  
 # Debug and Release flags
-set(DEBUG_FLAGS "-Werror -Wall -g -O0 ${COMMON_FLAGS}")
+set(DEBUG_FLAGS "-g3 -O0 ${COMMON_FLAGS}")
 set(RELEASE_FLAGS "-O2 ${COMMON_FLAGS}")
  
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -75,6 +77,23 @@ add_executable(lzcomp src/lzcomp/liblzcomp.c)
 target_link_libraries(lzcomp libeot)
 
 add_executable(teststream src/tests/test-stream.c src/util/stream.h src/util/stream.c)
+
+# -------------------------------------------------------------------
+# Fuzzer source
+set(FUZZER_SOURCE src/tests/fuzz-test.cc)
+ 
+# Create the fuzzer executable
+add_executable(fuzz_eot2ttf ${FUZZER_SOURCE})
+
+# Link with libeot and required libraries
+target_include_directories(fuzz_eot2ttf PRIVATE ${CMAKE_SOURCE_DIR}/inc)
+target_link_libraries(fuzz_eot2ttf PRIVATE libeot)
+
+# Enable libFuzzer specific flags
+target_compile_options(fuzz_eot2ttf PRIVATE -fsanitize=fuzzer,address,undefined)
+target_link_options(fuzz_eot2ttf PRIVATE -fsanitize=fuzzer,address,undefined)
+
+# -------------------------------------------------------------------
 
 enable_testing()
 add_test(

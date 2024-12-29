@@ -5,6 +5,9 @@
 
 #ifndef __LIBEOT_LIBEOT_H__
 #define __LIBEOT_LIBEOT_H__
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -20,5 +23,9 @@ enum EOTError EOT2ttf_buffer(const uint8_t *font, unsigned fontSize,
 
 void EOTfreeBuffer(const uint8_t *buffer);
 void EOTprintError(enum EOTError, FILE *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* #define __LIBEOT_LIBEOT_H__ */
