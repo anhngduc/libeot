@@ -289,27 +289,61 @@ enum StreamResult streamCopy(struct Stream *sIn, struct Stream *sOut,
   return EOT_STREAM_OK;
 }
 
-/* FIXME: This could be made A LOT faster. I am too lazy to figure out how. */
-enum StreamResult readNBits(struct Stream *s, uint32_t *out, unsigned n)
-{
-  const uint8_t masks[] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
-  if (n > 32) {
-    return EOT_VALUE_OUT_OF_BOUNDS;
-  }
-  *out = 0;
-  for (unsigned i = 0; i < n; ++i) {
-    if (s->pos >= s->size) {
-      return EOT_NOT_ENOUGH_DATA;
+enum StreamResult readNBits(struct Stream *s, uint32_t *out, unsigned n) {
+    if (n == 0) {
+        *out = 0;
+        return EOT_STREAM_OK;
     }
-    bool bitSet = (s->buf[s->pos] & masks[s->bitPos]) > 0;
-    *out |= (bitSet ? 1 : 0) << (n - i - 1);
-    ++s->bitPos;
-    if (s->bitPos == 8) {
-      s->bitPos = 0;
-      ++s->pos;
+    if (n > 32) {
+        return EOT_VALUE_OUT_OF_BOUNDS;
     }
-  }
-  return EOT_STREAM_OK;
+
+    uint32_t result = 0;
+    unsigned bits_remaining = n;
+
+    while (bits_remaining > 0) {
+        if (s->pos >= s->size) {
+            // Not enough full bytes. If s->bitPos is also 0, or bits_remaining > available in current non-existent byte.
+            // This check correctly identifies that we need more bytes but there are none.
+            return EOT_NOT_ENOUGH_DATA;
+        }
+
+        unsigned bits_can_read_from_byte = 8 - s->bitPos;
+        unsigned bits_to_read_now = (bits_remaining < bits_can_read_from_byte) ? bits_remaining : bits_can_read_from_byte;
+
+        // If bits_to_read_now is 0, it means s->bitPos is 8 (should have been reset) or bits_remaining was already satisfied.
+        // However, bits_remaining > 0 is the loop condition.
+        // If bits_can_read_from_byte is 0 (so s->bitPos is 8), s->pos should have incremented and s->bitPos reset.
+        // This state (bitPos=8) shouldn't be hit if logic is correct in advancing pos/bitPos.
+        // Let's assume s->bitPos < 8.
+
+        // Extract the bits from the current byte.
+        // These bits are the most significant (leftmost) available bits in the current byte fragment.
+        // Example: current byte B7 B6 B5 B4 B3 B2 B1 B0
+        // s->bitPos = 2 (B7 B6 already read). bits_can_read_from_byte = 6. (B5 B4 B3 B2 B1 B0 are available)
+        // bits_to_read_now = 3 (we want B5 B4 B3).
+        // 1. Mask to get relevant part: s->buf[s->pos] & (0xFF >> s->bitPos)
+        //    e.g., (B7 B6 B5 B4 B3 B2 B1 B0) & (00111111) = (00 B5 B4 B3 B2 B1 B0)
+        // 2. Shift right to make bits_to_read_now the LSBs:
+        //    (00 B5 B4 B3 B2 B1 B0) >> (bits_can_read_from_byte - bits_to_read_now)
+        //    e.g., (00 B5 B4 B3 B2 B1 B0) >> (6 - 3) = (00 B5 B4 B3 B2 B1 B0) >> 3 = (00000 B5 B4 B3)
+        uint8_t current_byte_masked = s->buf[s->pos] & (0xFF >> s->bitPos);
+        uint8_t extracted_value = current_byte_masked >> (bits_can_read_from_byte - bits_to_read_now);
+        
+        // Accumulate into result: existing result is shifted left, and new bits are ORed in.
+        result = (result << bits_to_read_now) | extracted_value;
+
+        s->bitPos += bits_to_read_now;
+        bits_remaining -= bits_to_read_now;
+
+        if (s->bitPos == 8) {
+            s->bitPos = 0;
+            s->pos++;
+        }
+    }
+
+    *out = result;
+    return EOT_STREAM_OK;
 }
 
 enum StreamResult BEcheckSum32(struct Stream *s, uint32_t *out,
