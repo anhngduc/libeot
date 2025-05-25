@@ -24,6 +24,44 @@ struct SFNTOffsetTable {
   uint16_t rangeShift;
 };
 
+// Common structure for MTX table version info
+struct MTXTableVersionInfo {
+  uint8_t majorVersion;
+  uint8_t minorVersion;
+  uint8_t tableFormat; // 1 for HDMX, 2 for VDMX
+};
+
+// For MTX HDMX
+// HdmxControlByte is just a uint8_t, will be read directly.
+// ResolutionRecord might not need a struct if it's just a series of read255UShort.
+
+// Placeholder for when we parse and reconstruct to standard OpenType HDMX DeviceRecord
+// (Not an MTX struct, but useful for the conversion target)
+// struct StandardHdmxDeviceRecord {
+//   uint8_t  pixelSize;
+//   uint8_t  maxWidth;
+//   uint8_t* widths; // numGlyphs
+// };
+
+
+// For MTX VDMX
+// VdmxControlByte is just a uint8_t, will be read directly.
+
+// Placeholder for MTX VdmxGroup data. Actual vTable entries are read iteratively.
+// struct MTXVdmxGroupHeader {
+//   uint16_t recs; // Number of vTable entries that follow
+//   uint16_t startsz; // Starting yPelHeight
+//   uint16_t endsz;   // Ending yPelHeight
+// };
+
+// Placeholder for when we parse and reconstruct to standard OpenType vTable
+// (Not an MTX struct, but useful for the conversion target)
+// struct StandardVTableEntry {
+//    uint16_t yPelHeight;
+//    int16_t  yMax;
+//    int16_t  yMin;
+// };
+
 enum StreamResult parseOffsetTable(struct Stream *s,
                                    struct SFNTOffsetTable *tbl)
 {
@@ -35,12 +73,479 @@ enum StreamResult parseOffsetTable(struct Stream *s,
   RD(BEReadU16, s, &tbl->rangeShift, res);
   return EOT_STREAM_OK;
 }
-/*
-enum EOTError populateHdmx(struct SFNTTable *hdmx, struct TTFmaxpData
-*maxpData, struct TTFheadData *headData, struct TTFhmtxData *hmtxData, struct
-Stream *s)
-{
-}*/
+
+enum EOTError populateHdmx(struct SFNTTable *hdmxTable,
+                           struct TTFmaxpData *maxpData, struct Stream *s) {
+  enum StreamResult sRes;
+  unsigned originalStreamPosS = 0;
+  unsigned mtxHdmxStartPos = 0;
+  struct Stream sOut = constructStream(NULL, 0);
+  uint32_t originalMtxTableSize = 0;
+
+  if (!maxpData) {
+    logWarning("populateHdmx (MTX): maxpData is NULL.\n");
+    return EOT_LOGIC_ERROR;
+  }
+  if (maxpData->numGlyphs == 0) {
+    logWarning("populateHdmx (MTX): numGlyphs is 0, cannot process HDMX records.\n");
+    // This could be valid for an empty font, but hdmx would be mostly pointless.
+    // For now, treat as success with an empty output table.
+    hdmxTable->buf = NULL;
+    hdmxTable->bufSize = 0;
+    return EOT_SUCCESS;
+  }
+  if (!hdmxTable) {
+    logWarning("populateHdmx (MTX): hdmxTable is NULL.\n");
+    return EOT_LOGIC_ERROR;
+  }
+  if (!s) {
+    logWarning("populateHdmx (MTX): Stream s is NULL.\n");
+    return EOT_LOGIC_ERROR;
+  }
+
+  originalStreamPosS = tell(s);
+  originalMtxTableSize = hdmxTable->bufSize; // Size of the incoming MTX compressed table
+
+  sRes = seekAbsolute(s, hdmxTable->offset);
+  if (sRes != EOT_STREAM_OK) {
+    logWarning("populateHdmx (MTX): Failed to seek to MTX hdmx table offset %u.\n", hdmxTable->offset);
+    // freeStream(&sOut); // sOut is on stack, its buffer is NULL or managed by freeStream
+    return EOT_CORRUPT_FILE;
+  }
+  mtxHdmxStartPos = tell(s);
+
+  // 2. Parse MTXTableVersionInfo
+  struct MTXTableVersionInfo mtxVersion;
+  sRes = BEReadU8(s, &mtxVersion.majorVersion);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+  sRes = BEReadU8(s, &mtxVersion.minorVersion);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+  sRes = BEReadU8(s, &mtxVersion.tableFormat);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+
+  if (mtxVersion.majorVersion != 1 ||
+      (mtxVersion.minorVersion != 0 && mtxVersion.minorVersion != 1) ||
+      mtxVersion.tableFormat != 1) {
+    logWarning("populateHdmx (MTX): Invalid MTX version/format. Major: %u, Minor: %u, Format: %u. Expected 1.0/1.1 and format 1.\n",
+               mtxVersion.majorVersion, mtxVersion.minorVersion, mtxVersion.tableFormat);
+    goto fail_mtx_corrupt;
+  }
+
+  // 3. Parse HdmxControlByte
+  uint8_t controlByte;
+  sRes = BEReadU8(s, &controlByte);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+  bool hasXResRecords = (controlByte & 0x80) != 0;
+  bool hasYResRecords = (controlByte & 0x40) != 0;
+
+  // 4. Parse ResolutionRecords (if present) and discard
+  uint16_t tempResCount, tempRes;
+  if (hasXResRecords) {
+    sRes = read255UShort(s, &tempResCount);
+    if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    for (uint16_t i = 0; i < tempResCount; ++i) {
+      sRes = read255UShort(s, &tempRes);
+      if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    }
+  }
+  if (hasYResRecords) {
+    sRes = read255UShort(s, &tempResCount);
+    if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    for (uint16_t i = 0; i < tempResCount; ++i) {
+      sRes = read255UShort(s, &tempRes);
+      if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    }
+  }
+
+  // 5. Prepare for Standard HDMX Output Construction
+  uint16_t standardHdmxVersion = 0;
+  uint32_t standardSizeDeviceRecord = (2 + maxpData->numGlyphs + 3) & ~3; // pixelSize (u8), maxWidth (u8), widths[numGlyphs] (u8), padding
+  unsigned numRecordsPlaceholderPos = 0;
+
+  sRes = BEWriteU16(&sOut, standardHdmxVersion);
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  numRecordsPlaceholderPos = sOut.pos;
+  sRes = BEWriteU16(&sOut, 0); // Placeholder for numRecords
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  sRes = BEWriteU32(&sOut, standardSizeDeviceRecord);
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  
+  // 6. Parse MTX DeviceRecords and Construct Standard DeviceRecords
+  uint16_t actualNumDeviceRecords = 0;
+  while (tell(s) < mtxHdmxStartPos + originalMtxTableSize) {
+    if (tell(s) == mtxHdmxStartPos + originalMtxTableSize) break; // Reached end exactly
+
+    actualNumDeviceRecords++;
+    uint16_t pixelSizeMTX, maxWidthMTX;
+
+    sRes = read255UShort(s, &pixelSizeMTX);
+    if (sRes != EOT_STREAM_OK) goto fail_mtx_read_loop;
+    sRes = read255UShort(s, &maxWidthMTX);
+    if (sRes != EOT_STREAM_OK) goto fail_mtx_read_loop;
+
+    if (pixelSizeMTX > 255) {
+      logWarning("populateHdmx (MTX): pixelSize %u truncated to %u for record %u.\n", pixelSizeMTX, (uint8_t)pixelSizeMTX, actualNumDeviceRecords);
+    }
+    if (maxWidthMTX > 255) {
+      logWarning("populateHdmx (MTX): maxWidth %u truncated to %u for record %u.\n", maxWidthMTX, (uint8_t)maxWidthMTX, actualNumDeviceRecords);
+    }
+    sRes = BEWriteU8(&sOut, (uint8_t)pixelSizeMTX);
+    if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+    sRes = BEWriteU8(&sOut, (uint8_t)maxWidthMTX);
+    if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+    for (uint16_t g = 0; g < maxpData->numGlyphs; ++g) {
+      uint16_t advanceWidthMTX;
+      sRes = read255UShort(s, &advanceWidthMTX);
+      if (sRes != EOT_STREAM_OK) {
+         logWarning("populateHdmx (MTX): Failed to read advance width for glyph %u in DeviceRecord %u (pixelSize %u).\n", g, actualNumDeviceRecords, pixelSizeMTX);
+         goto fail_mtx_read_loop;
+      }
+      if (advanceWidthMTX > 255) {
+        logWarning("populateHdmx (MTX): AdvanceWidth %u for glyph %u in DeviceRecord %u (pixelSize %u) truncated to %u.\n",
+                   advanceWidthMTX, g, actualNumDeviceRecords, pixelSizeMTX, (uint8_t)advanceWidthMTX);
+      }
+      sRes = BEWriteU8(&sOut, (uint8_t)advanceWidthMTX);
+      if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+    }
+
+    unsigned numWidthsWritten = 2 + maxpData->numGlyphs; // pixelSize, maxWidth, and all glyph widths
+    unsigned padBytes = standardSizeDeviceRecord - numWidthsWritten;
+    for (unsigned p = 0; p < padBytes; ++p) {
+      sRes = BEWriteU8(&sOut, 0);
+      if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+    }
+    // Check for overrun after each full record processing
+    if (tell(s) > mtxHdmxStartPos + originalMtxTableSize) {
+        logWarning("populateHdmx (MTX): Stream read overrun while parsing DeviceRecord %u.\n", actualNumDeviceRecords);
+        goto fail_mtx_corrupt;
+    }
+  }
+  
+  // Check if we read exactly the amount of data specified by originalMtxTableSize
+  if (tell(s) != mtxHdmxStartPos + originalMtxTableSize) {
+     logWarning("populateHdmx (MTX): Did not read the full MTX HDMX table. Expected end: %u, actual end: %u.\n",
+                mtxHdmxStartPos + originalMtxTableSize, tell(s));
+     // This could be an error, or MTX table has trailing data. For now, treat as potential corruption.
+     goto fail_mtx_corrupt;
+  }
+
+
+  // 7. Finalize Standard HDMX Header
+  unsigned finalSOutSize = sOut.pos;
+  sRes = seekAbsolute(&sOut, numRecordsPlaceholderPos);
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write; // Should not happen with memory stream
+  sRes = BEWriteU16(&sOut, actualNumDeviceRecords);
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  sRes = seekAbsolute(&sOut, finalSOutSize);
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+  // 8. Populate hdmxTable
+  if (hdmxTable->buf) { // Free existing buffer if any
+    free(hdmxTable->buf);
+  }
+  hdmxTable->buf = sOut.buf;
+  hdmxTable->bufSize = sOut.pos;
+  sOut.buf = NULL; // Transfer ownership, prevent double free by freeStream
+
+  // 9. Cleanup
+  freeStream(&sOut); // Frees internal structures of sOut if any, not the buffer now
+  sRes = seekAbsolute(s, originalStreamPosS);
+  if (sRes != EOT_STREAM_OK) {
+    logWarning("populateHdmx (MTX): Failed to restore original stream s position.\n");
+    // This is a minor issue as the main task is done.
+  }
+  return EOT_SUCCESS;
+
+fail_mtx_read_loop:
+  logWarning("populateHdmx (MTX): Failed to read data for DeviceRecord %u from MTX stream.\n", actualNumDeviceRecords);
+  goto fail_mtx_corrupt;
+
+fail_mtx_read:
+  logWarning("populateHdmx (MTX): Failed to read from MTX stream (pos %u, table start %u, table size %u).\n", tell(s), mtxHdmxStartPos, originalMtxTableSize);
+  // Fall through to fail_mtx_corrupt
+fail_mtx_corrupt:
+  freeStream(&sOut);
+  seekAbsolute(s, originalStreamPosS);
+  return EOT_HDMX_MTX_CORRUPT;
+
+fail_sout_write:
+  logWarning("populateHdmx (MTX): Failed to write to output stream for standard HDMX table.\n");
+  freeStream(&sOut);
+  seekAbsolute(s, originalStreamPosS);
+  return EOT_CORRUPT_FILE; // Generic file/stream error for output
+}
+
+enum EOTError populateVdmx(struct SFNTTable *vdmxTable, struct Stream *s) {
+  enum StreamResult sRes;
+  unsigned originalStreamPosS = 0;
+  unsigned mtxVdmxStartPos = 0;
+  struct Stream sOut = constructStream(NULL, 0);
+  uint32_t originalMtxTableSize = 0;
+  uint16_t numStandardRatioRanges = 0;
+  uint16_t actualNumVdmxGroups = 0;
+  uint32_t *vdmxGroupActualSOutOffsets = NULL; // Store sOut offsets for groups
+
+  unsigned numRecsPlaceholderPos = 0;
+  unsigned numRatiosPlaceholderPos = 0;
+  unsigned groupOffsetsPlaceholderStartSOut = 0;
+  uint8_t defaultBCharSet = 1; // Windows ANSI
+
+  if (!vdmxTable) {
+    logWarning("populateVdmx (MTX): vdmxTable is NULL.\n");
+    return EOT_LOGIC_ERROR;
+  }
+  if (!s) {
+    logWarning("populateVdmx (MTX): Stream s is NULL.\n");
+    return EOT_LOGIC_ERROR;
+  }
+
+  originalStreamPosS = tell(s);
+  originalMtxTableSize = vdmxTable->bufSize;
+
+  sRes = seekAbsolute(s, vdmxTable->offset);
+  if (sRes != EOT_STREAM_OK) {
+    logWarning("populateVdmx (MTX): Failed to seek to MTX vdmx table offset %u.\n", vdmxTable->offset);
+    goto fail_corrupt_file;
+  }
+  mtxVdmxStartPos = tell(s);
+
+  // 2. Parse MTXTableVersionInfo
+  struct MTXTableVersionInfo mtxVersion;
+  sRes = BEReadU8(s, &mtxVersion.majorVersion);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+  sRes = BEReadU8(s, &mtxVersion.minorVersion);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+  sRes = BEReadU8(s, &mtxVersion.tableFormat);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+
+  if (mtxVersion.majorVersion != 1 ||
+      (mtxVersion.minorVersion != 0 && mtxVersion.minorVersion != 1) ||
+      mtxVersion.tableFormat != 2) { // Format 2 for VDMX
+    logWarning("populateVdmx (MTX): Invalid MTX version/format. Major: %u, Minor: %u, Format: %u. Expected 1.0/1.1 and format 2.\n",
+               mtxVersion.majorVersion, mtxVersion.minorVersion, mtxVersion.tableFormat);
+    goto fail_mtx_corrupt;
+  }
+
+  // 3. Parse VdmxControlByte
+  uint8_t controlByte;
+  sRes = BEReadU8(s, &controlByte);
+  if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+  bool hasXResRecords = (controlByte & 0x80) != 0;
+  bool hasYResRecords = (controlByte & 0x40) != 0;
+  uint8_t ratioFlags = controlByte & 0x03;
+
+  // 4. Parse ResolutionRecords (if present) and discard
+  uint16_t tempResCount, tempRes;
+  if (hasXResRecords) {
+    sRes = read255UShort(s, &tempResCount);
+    if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    for (uint16_t i = 0; i < tempResCount; ++i) {
+      sRes = read255UShort(s, &tempRes);
+      if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    }
+  }
+  if (hasYResRecords) {
+    sRes = read255UShort(s, &tempResCount);
+    if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    for (uint16_t i = 0; i < tempResCount; ++i) {
+      sRes = read255UShort(s, &tempRes);
+      if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+    }
+  }
+  
+  // 5. Prepare Standard VDMX Header in sOut (Placeholders for numRecs, numRatios)
+  uint16_t standardVdmxVersion = 1;
+  sRes = BEWriteU16(&sOut, standardVdmxVersion);
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  
+  numRecsPlaceholderPos = sOut.pos;
+  sRes = BEWriteU16(&sOut, 0); // Placeholder for numRecs (VDMX groups)
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+  numRatiosPlaceholderPos = sOut.pos;
+  sRes = BEWriteU16(&sOut, 0); // Placeholder for numRatios
+  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+  // 6. Parse MTX Ratio Info and Construct Standard RatioRange Records in sOut
+  unsigned ratioDataStartSOut = sOut.pos;
+  switch (ratioFlags) {
+    case 0x00: // No ratio data
+      numStandardRatioRanges = 0;
+      break;
+    case 0x01: // 1:1 aspect ratio
+      numStandardRatioRanges = 1;
+      sRes = BEWriteU8(&sOut, defaultBCharSet); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*xRatio*/  if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*yStartRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*yEndRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      break;
+    case 0x02: // 1:1 and 2:1 aspect ratios
+      numStandardRatioRanges = 2;
+      sRes = BEWriteU8(&sOut, defaultBCharSet); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*xRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*yStartRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*yEndRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+      sRes = BEWriteU8(&sOut, defaultBCharSet); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 2); /*xRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*yStartRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteU8(&sOut, 1); /*yEndRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      break;
+    case 0x03: // Explicit records
+      sRes = read255UShort(s, &numStandardRatioRanges);
+      if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+      if (numStandardRatioRanges == 0 && tell(s) < mtxVdmxStartPos + originalMtxTableSize) {
+          // If numStandardRatioRanges is 0, there should be no more data for groups.
+          // This check handles if MTX says 0 ratios but provides group data.
+          logWarning("populateVdmx (MTX): ratioFlags indicate explicit records, numStandardRatioRanges is 0, but data remains.\n");
+          goto fail_mtx_corrupt;
+      }
+      for (uint16_t i = 0; i < numStandardRatioRanges; ++i) {
+        uint8_t xR, yR;
+        sRes = BEReadU8(s, &xR); if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+        sRes = BEReadU8(s, &yR); if (sRes != EOT_STREAM_OK) goto fail_mtx_read;
+        sRes = BEWriteU8(&sOut, defaultBCharSet); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+        sRes = BEWriteU8(&sOut, xR); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+        sRes = BEWriteU8(&sOut, yR); /*yStartRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+        sRes = BEWriteU8(&sOut, yR); /*yEndRatio*/ if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      }
+      break;
+  }
+
+  groupOffsetsPlaceholderStartSOut = sOut.pos;
+  // Reserve space for group offsets
+  for (uint16_t i = 0; i < numStandardRatioRanges; ++i) {
+    sRes = BEWriteU16(&sOut, 0); // Placeholder offset
+    if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  }
+
+  // 7. Parse MTX VdmxGroups and Construct Standard VDMXGroup Tables in sOut
+  if (numStandardRatioRanges > 0) {
+    vdmxGroupActualSOutOffsets = calloc(numStandardRatioRanges, sizeof(uint32_t));
+    if (!vdmxGroupActualSOutOffsets) {
+      logWarning("populateVdmx (MTX): Failed to allocate memory for group offsets.\n");
+      goto fail_memory;
+    }
+  }
+
+  unsigned currentGroupDataStartPosSOut = sOut.pos; // Start of the actual group data
+  for (uint16_t i = 0; i < numStandardRatioRanges; ++i) {
+    if (tell(s) >= mtxVdmxStartPos + originalMtxTableSize) {
+      logWarning("populateVdmx (MTX): Insufficient data in MTX stream for declared VdmxGroup %u.\n", i);
+      goto fail_mtx_corrupt;
+    }
+    
+    vdmxGroupActualSOutOffsets[i] = sOut.pos; // Offset from start of sOut
+    actualNumVdmxGroups++;
+
+    uint16_t recs, startszMTX, endszMTX;
+    sRes = read255UShort(s, &recs); if (sRes != EOT_STREAM_OK) goto fail_mtx_read_group_loop;
+    sRes = read255UShort(s, &startszMTX); if (sRes != EOT_STREAM_OK) goto fail_mtx_read_group_loop;
+    sRes = read255UShort(s, &endszMTX); if (sRes != EOT_STREAM_OK) goto fail_mtx_read_group_loop;
+
+    if (startszMTX > 255) logWarning("populateVdmx (MTX): startsz %u truncated to %u for group %u.\n", startszMTX, (uint8_t)startszMTX, i);
+    if (endszMTX > 255) logWarning("populateVdmx (MTX): endsz %u truncated to %u for group %u.\n", endszMTX, (uint8_t)endszMTX, i);
+
+    sRes = BEWriteU16(&sOut, recs); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+    sRes = BEWriteU8(&sOut, (uint8_t)startszMTX); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+    sRes = BEWriteU8(&sOut, (uint8_t)endszMTX); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+    for (uint16_t j = 0; j < recs; ++j) {
+      uint16_t yPelHeight;
+      int16_t yMax, yMin;
+      sRes = read255UShort(s, &yPelHeight); if (sRes != EOT_STREAM_OK) goto fail_mtx_read_group_loop;
+      sRes = read255Short(s, &yMax); if (sRes != EOT_STREAM_OK) goto fail_mtx_read_group_loop;
+      sRes = read255Short(s, &yMin); if (sRes != EOT_STREAM_OK) goto fail_mtx_read_group_loop;
+      
+      sRes = BEWriteU16(&sOut, yPelHeight); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteS16(&sOut, yMax); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+      sRes = BEWriteS16(&sOut, yMin); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+    }
+  }
+
+  // After loop, check if all MTX data was consumed as expected.
+  if (tell(s) != mtxVdmxStartPos + originalMtxTableSize) {
+    // If numStandardRatioRanges was 0, we expect to be at the end.
+    // If it was >0, we expect all groups for these ratios to have consumed the table.
+     if (numStandardRatioRanges > 0 || (originalMtxTableSize > (tell(s) - mtxVdmxStartPos))) {
+        logWarning("populateVdmx (MTX): MTX stream size mismatch. Expected end: %u, actual end: %u. numRatios: %u\n",
+                   mtxVdmxStartPos + originalMtxTableSize, tell(s), numStandardRatioRanges);
+        goto fail_mtx_corrupt;
+     }
+  }
+  
+  if (actualNumVdmxGroups != numStandardRatioRanges) {
+      // This case should ideally be caught by the stream end checks,
+      // but it's a good logical validation.
+      logWarning("populateVdmx (MTX): Number of parsed groups (%u) does not match number of ratio ranges (%u).\n",
+                 actualNumVdmxGroups, numStandardRatioRanges);
+      goto fail_mtx_corrupt;
+  }
+
+
+  // 8. Finalize Standard VDMX Header and Group Offsets in sOut
+  unsigned finalSOutSize = sOut.pos;
+  
+  sRes = seekAbsolute(&sOut, numRecsPlaceholderPos); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  sRes = BEWriteU16(&sOut, actualNumVdmxGroups); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  
+  sRes = seekAbsolute(&sOut, numRatiosPlaceholderPos); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  sRes = BEWriteU16(&sOut, numStandardRatioRanges); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+  sRes = seekAbsolute(&sOut, groupOffsetsPlaceholderStartSOut); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  for (uint16_t i = 0; i < numStandardRatioRanges; ++i) {
+    if (vdmxGroupActualSOutOffsets[i] > UINT16_MAX) {
+        logWarning("populateVdmx (MTX): VDMXGroup offset %u exceeds UINT16_MAX.\n", vdmxGroupActualSOutOffsets[i]);
+        goto fail_mtx_corrupt; // Standard VDMX uses uint16_t for these offsets
+    }
+    sRes = BEWriteU16(&sOut, (uint16_t)vdmxGroupActualSOutOffsets[i]);
+    if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+  }
+  
+  sRes = seekAbsolute(&sOut, finalSOutSize); if (sRes != EOT_STREAM_OK) goto fail_sout_write;
+
+  // 9. Populate vdmxTable
+  if (vdmxTable->buf) free(vdmxTable->buf);
+  vdmxTable->buf = sOut.buf;
+  vdmxTable->bufSize = sOut.pos;
+  sOut.buf = NULL; 
+
+  // 10. Cleanup
+  if (vdmxGroupActualSOutOffsets) free(vdmxGroupActualSOutOffsets);
+  freeStream(&sOut);
+  sRes = seekAbsolute(s, originalStreamPosS);
+  if (sRes != EOT_STREAM_OK) {
+    logWarning("populateVdmx (MTX): Failed to restore original stream s position.\n");
+  }
+  return EOT_SUCCESS;
+
+fail_mtx_read_group_loop:
+    logWarning("populateVdmx (MTX): Failed to read data for VTable entry in group %u from MTX stream.\n", actualNumVdmxGroups -1);
+    goto fail_mtx_corrupt;
+fail_mtx_read:
+  logWarning("populateVdmx (MTX): Failed to read from MTX stream (pos %u, table start %u, table size %u).\n", tell(s), mtxVdmxStartPos, originalMtxTableSize);
+  // Fall through
+fail_mtx_corrupt:
+  if (vdmxGroupActualSOutOffsets) free(vdmxGroupActualSOutOffsets);
+  freeStream(&sOut);
+  seekAbsolute(s, originalStreamPosS);
+  return EOT_VDMX_MTX_CORRUPT;
+
+fail_sout_write:
+  logWarning("populateVdmx (MTX): Failed to write to output stream for standard VDMX table.\n");
+  // Fall through
+fail_memory: // Used if calloc fails
+  if (vdmxGroupActualSOutOffsets) free(vdmxGroupActualSOutOffsets);
+  freeStream(&sOut);
+  seekAbsolute(s, originalStreamPosS);
+  return EOT_CANT_ALLOCATE_MEMORY; // More specific than EOT_CORRUPT_FILE
+
+fail_corrupt_file: // Used for initial seek failure on s
+  freeStream(&sOut); // sOut.buf would be NULL here
+  return EOT_CORRUPT_FILE;
+}
+
 
 enum StreamResult _ucvt_rdVal(struct Stream *sIn, int16_t *lastValue)
 {
@@ -693,6 +1198,10 @@ enum EOTError parseCTF(struct Stream **streams, struct SFNTContainer **out)
   *out = NULL;
   enum EOTError result = constructContainer(out);
   struct SFNTOffsetTable offsetTable;
+  struct SFNTTable *hdmx_sfnt_table_ptr = NULL; 
+  struct SFNTTable *vdmx_sfnt_table_ptr = NULL; 
+  struct SFNTTable *hdmx_sfnt_table = NULL;
+  struct SFNTTable *vdmx_sfnt_table = NULL;
   enum StreamResult sResult = parseOffsetTable(streams[0], &offsetTable);
   if (sResult != EOT_STREAM_OK) {
     return EOT_CORRUPT_FILE;
@@ -707,14 +1216,6 @@ enum EOTError parseCTF(struct Stream **streams, struct SFNTContainer **out)
       RD2(BEReadChar, streams[0], tag + j, sResult);
     }
     struct SFNTTable *tbl;
-    // TO-DO: Fix hdmx|VDMX table
-    if (strncmp(tag, "hdmx", 4) == 0 || strncmp(tag, "VDMX", 4) == 0 ) {
-      // skip checkSum, offset, length to next table offset
-      sResult = seekRelative(streams[0], 12);
-      logWarning("Ignoring hdmx/VDMX table -- will be fixed in a future release.\n");
-      continue;
-    }
-    
     result = addTable(*out, tag, &tbl);
     /* skip the checksum, which we are not using for now. */
     sResult = seekRelative(streams[0], 4);
@@ -726,6 +1227,7 @@ enum EOTError parseCTF(struct Stream **streams, struct SFNTContainer **out)
   }
   struct SFNTTable *glyf = NULL, *loca = NULL, *maxp = NULL, *head = NULL,
   *hmtx = NULL;
+  // hdmx_sfnt_table_ptr and vdmx_sfnt_table_ptr are declared at the function start
   for (unsigned i = 0; i < (*out)->numTables; ++i) {
     struct SFNTTable *tbl = &((*out)->tables[i]);
     bool loadTable = true;
@@ -736,24 +1238,29 @@ enum EOTError parseCTF(struct Stream **streams, struct SFNTContainer **out)
       glyf = tbl;
       loadTable = false;
     } else if (strncmp(tbl->tag, "maxp", 4) == 0) {
-      maxp = tbl;
+      maxp = tbl; 
+      // maxp table data will be loaded by the generic loadTableFromStream
     } else if (strncmp(tbl->tag, "head", 4) == 0) {
       head = tbl;
+      // head table data will be loaded by the generic loadTableFromStream
     } else if (strncmp(tbl->tag, "hmtx", 4) == 0) {
       hmtx = tbl;
-    } else if (strncmp(tbl->tag, "hdmx", 4) == 0
-               || strncmp(tbl->tag, "VDMX", 4) == 0) {
-      // this was already checked above
-      return EOT_LOGIC_ERROR;
+      // hmtx table data will be loaded by the generic loadTableFromStream
+    } else if (strncmp(tbl->tag, "hdmx", 4) == 0) {
+      hdmx_sfnt_table_ptr = tbl; // Capture pointer for deferred processing
+      loadTable = false;         // Prevent generic loading
+    } else if (strncmp(tbl->tag, "VDMX", 4) == 0) {
+      vdmx_sfnt_table_ptr = tbl; // Capture pointer for deferred processing
+      loadTable = false;         // Prevent generic loading
     } else if (strncmp(tbl->tag, "cvt ", 4) == 0) {
       result = unpackCVT(tbl, streams[0]);
-      if (result != EOT_SUCCESS) {
+      if (result != EOT_SUCCESS && result < EOT_WARN) {
+        // Proper cleanup of SFNTContainer 'out' might be needed here
         return result;
       }
       loadTable = false;
-    } else if (strncmp(tbl->tag, "VDMX", 4) == 0) {
-      loadTable = false;
     }
+    // Other tables will be loaded by the generic loadTableFromStream call below
     if (loadTable) {
       result = loadTableFromStream(tbl, streams[0]);
       if (result != EOT_SUCCESS) {
@@ -800,16 +1307,30 @@ enum EOTError parseCTF(struct Stream **streams, struct SFNTContainer **out)
   }
   if (glyf) {
     result = populateGlyfAndLoca(glyf, loca, &headData, &maxpData, streams);
-    if (result != EOT_SUCCESS) {
+    if (result != EOT_SUCCESS && result < EOT_WARN) { // Check for critical errors
+      // Consider proper cleanup of SFNTContainer 'out' before returning
       return result;
     }
   }
-  /* result = populateHdmx(hdmx, &maxpData, &headData, &hmtxData, streams[0]);
-  if (result != EOT_SUCCESS)
-  {
-    return result;
+
+  // Process HDMX and VDMX tables now that maxpData (and headData) are parsed and available
+  if (hdmx_sfnt_table_ptr) {
+    result = populateHdmx(hdmx_sfnt_table_ptr, &maxpData, streams[0]);
+    if (result != EOT_SUCCESS && result < EOT_WARN) {
+      // Proper cleanup of SFNTContainer 'out' might be needed here
+      return result;
+    }
   }
-  */
+
+  if (vdmx_sfnt_table_ptr) {
+    // populateVdmx doesn't require maxpData directly, but is processed here for consistency
+    result = populateVdmx(vdmx_sfnt_table_ptr, streams[0]);
+    if (result != EOT_SUCCESS && result < EOT_WARN) {
+      // Proper cleanup of SFNTContainer 'out' might be needed here
+      return result;
+    }
+  }
+  // The old commented-out populateHdmx call is assumed to be removed already.
   return EOT_SUCCESS;
 }
 
